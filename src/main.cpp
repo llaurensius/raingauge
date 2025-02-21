@@ -1,10 +1,7 @@
-/*
-  Lora Node2
-  The IoT Projects
-*/
-
-#include <SPI.h>              // Include libraries
-#include <LoRa.h>
+#include <EEPROM.h>
+#include <RHRouter.h>
+#include <RHMesh.h>
+#include <RH_RF95.h>
 #include <SoftwareSerial.h>
 #include <Arduino.h>
 #include "FS.h"
@@ -13,24 +10,56 @@
 #include <DS3231-RTC.h>
 #include <FastLED.h>
 
-#define ss 15
-#define rst 26
-#define dio0 27
+#define LED 13
+#define N_NODES 5 // Total number of nodes: N1, N2, N3, N4, N5
+#define EEPROM_ADDRESS 0 // EEPROM address to store node ID
+#define GOSSIP_PROBABILITY 0.7 // 70% chance to forward the message
+
+/// Pin definitions for ESP32-MisRed
+#define RFM95_CS 15    // Chip Select
+#define RFM95_RST 26   // Reset
+#define RFM95_INT 27   // DIO0
+//*/
+/*// Pin definitions for ESP32-WROOM32
+#define RFM95_CS 15    // Chip Select
+#define RFM95_RST 26   // Reset
+#define RFM95_INT 27   // DIO0
+//*/
+/*// Pin definitions for ESP32-TTGO
+#define RFM95_CS 15    // Chip Select
+#define RFM95_RST 26   // Reset
+#define RFM95_INT 27   // DIO0
+//*/
+
 #define enTxPin 4   // HIGH: TX and LOW: RX
 #define LED_PIN     2
 #define NUM_LEDS    2
+
+const int RX_PIN = 14;  // Pin RX ESP32
+const int TX_PIN = 0;  // Pin TX ESP32
 
 RTClib myRTC; // RTC library instance
 const int CS = 5; // Chip select pin for SD card
 
 SoftwareSerial mySerial(16, 17); // RX, TX
 SoftwareSerial mySerial1(35, 34); // RX, TX
+SoftwareSerial mySerial2(RX_PIN, TX_PIN); // RX, TX
+String dataMeasurement = "";
 
 CRGB leds[NUM_LEDS];
 int hue = 0; // Variabel untuk menyimpan nilai Hue
 
+// Set Parameter LoRa
+uint8_t setTxPower = 15;
+uint8_t setSpreadingFactor = 7;
+
 // Prototipe deklarasi fungsi
 uint16_t calculateCRC(uint8_t *data, uint8_t len);
+
+uint8_t nodeId; 
+char buf[RH_MESH_MAX_MESSAGE_LEN]; // Buffer for messages
+RH_RF95 rf95(RFM95_CS, RFM95_INT); // RF95 driver with specified pins
+RHMesh *manager; // Mesh manager
 
 void blinkLED0(CRGB color, int times, int delayTime) {
   for (int i = 0; i < times; i++) {
@@ -47,22 +76,22 @@ unsigned char data[4] = {};
 String outgoing;              // Outgoing message
 byte msgCount = 0;            // Count of outgoing messages
 byte MasterNode = 0xFF;
-byte Node2 = 0xCC;
+byte Node1 = 0xBB;
 
 int Rain_val;
 String Mymessage = "";
 float distance;
 
 // Timing
-unsigned long previousMillis = 0;  // Timer for sending data
-const int sendInterval = 5000;     // Send data every 5 seconds
+unsigned long previousMillis = 0; // Menyimpan waktu terakhir  
+const long interval = 5000; // Interval waktu dalam milidetik  
 
 void initSDCard() {
   while (true) { // Loop tak terbatas untuk mencoba inisialisasi
-    Serial.print("t0.txt=\"Initializing SD card...\"");
+    Serial.println("t0.txt=\"Initializing SD card...\"");
 
     if (SD.begin(CS)) {
-      Serial.print("t0.txt=\"SD card initialization successful!\""); // Jika berhasil
+      Serial.println("t0.txt=\"SD card initialization successful!\""); // Jika berhasil
       break; // Keluar dari loop jika inisialisasi berhasil
     } else {
       Serial.print("t0.txt=\"Initialization failed! Retrying in 5 seconds...\"");
@@ -74,17 +103,6 @@ void initSDCard() {
       delay(5000);
     }
   }
-}
-
-void sendMessage(String outgoing, byte MasterNode, byte Node2) {
-  LoRa.beginPacket();               // Start packet
-  LoRa.write(MasterNode);           // Add destination address (Master Node)
-  LoRa.write(Node2);                // Add sender address (this Node2)
-  LoRa.write(msgCount);             // Add message ID
-  LoRa.write(outgoing.length());    // Add payload length
-  LoRa.print(outgoing);             // Add payload (the data)
-  LoRa.endPacket();                 // Finish packet and send it
-  msgCount++;                       // Increment message ID
 }
 
 void bacaRain() {
@@ -190,7 +208,7 @@ void Datalog() {
 
   String getMonthStr = now.getMonth() < 10 ? "0" + String(now.getMonth()) : String(now.getMonth());
   String getDayStr = now.getDay() < 10 ? "0" + String(now.getDay()) : String(now.getDay());
-  String namaFile = getDayStr + getMonthStr + String(now.getYear(), DEC);
+  String namaFile = getDayStr + getMonthStr + String(now.getYear(), DEC) + "_TxPower " + String(setTxPower) +"_SpreadingFactor " + String(setSpreadingFactor);
 
   File myFile10 = SD.open("/datalog/" + namaFile + ".txt", FILE_APPEND);
   if (myFile10) {
@@ -206,7 +224,7 @@ void Datalog() {
     myFile10.print(":");
     myFile10.print(now.getSecond(), DEC);
     myFile10.print(", ");
-    myFile10.print("Rain: ");
+    myFile10.print("Success send: Rain: ");
     myFile10.print(Rain_val);
     myFile10.print(" mm, ");
     myFile10.print("Distance: ");
@@ -220,79 +238,180 @@ void Datalog() {
   }
 }
 
+void DatalogFailed() {
+  DateTime now = myRTC.now();
+
+  String getMonthStr = now.getMonth() < 10 ? "0" + String(now.getMonth()) : String(now.getMonth());
+  String getDayStr = now.getDay() < 10 ? "0" + String(now.getDay()) : String(now.getDay());
+  String namaFile = getDayStr + getMonthStr + String(now.getYear(), DEC) + "_TxPower " + String(setTxPower) +"_SpreadingFactor " + String(setSpreadingFactor);
+
+  File myFile10 = SD.open("/datalog/" + namaFile + ".txt", FILE_APPEND);
+  if (myFile10) {
+    myFile10.print(now.getYear(), DEC);
+    myFile10.print("-");
+    myFile10.print(now.getMonth(), DEC);
+    myFile10.print("-");
+    myFile10.print(now.getDay(), DEC);
+    myFile10.print(" ");
+    myFile10.print(now.getHour(), DEC);
+    myFile10.print(":");
+    myFile10.print(now.getMinute(), DEC);
+    myFile10.print(":");
+    myFile10.print(now.getSecond(), DEC);
+    myFile10.print(", ");
+    myFile10.print("Failed send: Rain: ");
+    myFile10.print(Rain_val);
+    myFile10.print(" mm, ");
+    myFile10.print("Distance: ");
+    myFile10.print(distance / 10);
+    myFile10.print(" cm");
+    myFile10.println("");
+    myFile10.close();
+
+  } else {
+    Serial.println("error");
+  }
+}
+
+void DatalogMeasurement() {
+  if (mySerial2.available() > 0) {
+    // Membaca data yang diterima
+    dataMeasurement = mySerial2.readStringUntil('\n');
+    // Serial.println("Data diterima: " + dataMeasurement); // Debugging
+  }  else {
+    // Serial.println("Tidak ada data yang tersedia di mySerial2."); // Debugging
+  }
+
+  DateTime now = myRTC.now();
+
+  String getMonthStr = now.getMonth() < 10 ? "0" + String(now.getMonth()) : String(now.getMonth());
+  String getDayStr = now.getDay() < 10 ? "0" + String(now.getDay()) : String(now.getDay());
+  String namaFile = getDayStr + getMonthStr + String(now.getYear(), DEC) + "_measurementlog_TxPower " + String(setTxPower) + "_SpreadingFactor " + String(setSpreadingFactor);
+
+  File myFile10 = SD.open("/datalog/" + namaFile + ".txt", FILE_APPEND);
+  if (myFile10) {
+    myFile10.print(now.getYear(), DEC);
+    myFile10.print("-");
+    myFile10.print(now.getMonth(), DEC);
+    myFile10.print("-");
+    myFile10.print(now.getDay(), DEC);
+    myFile10.print(" ");
+    myFile10.print(now.getHour(), DEC);
+    myFile10.print(":");
+    myFile10.print(now.getMinute(), DEC);
+    myFile10.print(":");
+    myFile10.print(now.getSecond(), DEC);
+    myFile10.print(", ");
+    myFile10.print(dataMeasurement);
+    myFile10.println("");
+    myFile10.close();
+
+  } else {
+    Serial.println("error");
+  }
+}
+
 void generateDummyData() {
   Rain_val = random(0, 100); // Nilai Rain_val antara 0-99
   distance = random(100, 3000); // Jarak antara 100 cm hingga 3000 cm
-  Serial.println("Generated Dummy Data - Rain: " + String(Rain_val) + " mm, Distance: " + String(distance / 10) + " cm");
+  // Serial.println("Generated Dummy Data - Rain: " + String(Rain_val) + " mm, Distance: " + String(distance / 10) + " cm");
 }
 
 void setup() {
-  Serial.begin(115200);        // Initialize serial
-  mySerial.begin(9600);        // Initialize SoftwareSerial
-  mySerial1.begin(9600);
-  Wire.begin();
+    randomSeed(analogRead(0));
+    Serial.begin(115200);
+    mySerial.begin(9600);        // Initialize SoftwareSerial
+    mySerial1.begin(9600);
+    mySerial2.begin(115200);
+    Wire.begin();
+    while (!Serial); // Wait for Serial Monitor
 
-  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+    FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
 
-  leds[0] = CRGB(0, 255, 0);      // LED 0 warna hijau dengan kecerahan penuh
-  leds[0].nscale8(255);           // Set kecerahan LED 0
-  FastLED.show();
+    leds[0] = CRGB(0, 255, 0);      // LED 0 warna hijau dengan kecerahan penuh
+    leds[0].nscale8(255);           // Set kecerahan LED 0
+    FastLED.show();
 
-  Serial.println("LoRa Node2");
+ 
+    initSDCard();
 
-  //   initSDCard();
-
-  LoRa.setPins(ss, rst, dio0);
-
-  if (!LoRa.begin(922E6)) {
-    Serial.println("Starting LoRa failed!");
-    blinkLED0(CRGB::Red, 2, 500);
-    while (1);
-  }
-
-  pinMode(enTxPin, OUTPUT);
-  digitalWrite(enTxPin, HIGH);  // Default ke TX mode
-}
-
-bool isChannelFree() {
-  // Fungsi untuk memeriksa apakah saluran bebas
-  int packetSize = LoRa.parsePacket();
-  return packetSize == 0; // Jika tidak ada paket yang diterima, saluran dianggap bebas
-}
-
-void loop() {
-  unsigned long currentMillis = millis();
-
-  leds[0] = CRGB(0, 255, 0);      // LED 0 warna hijau
-  leds[0].nscale8(255);           // Set kecerahan LED 0
-  FastLED.show();
-
-  leds[1] = CRGB(255, 255, 255);  // LED 1 warna putih
-  leds[1].nscale8(100);           // Set kecerahan LED 1
-  FastLED.show();
-
-  // Dapatkan data dummy
-  generateDummyData();
-  delay(5000);
-
-  // Kirim data setiap 5 detik
-  if (currentMillis - previousMillis >= sendInterval) {
-    
-    // Cek saluran sebelum mengirim data
-    if (isChannelFree()) {
-      Mymessage = String(Rain_val) + "," + String(distance / 10);
-      
-      // Kirim pesan ke MasterNode
-      sendMessage(Mymessage, MasterNode, Node2);
-      Serial.println("Data sent: " + Mymessage);
-
-      blinkLED0(CRGB::Blue, 2, 100);
-
-      previousMillis = currentMillis; // Atur ulang timer untuk interval berikutnya
-    } else {
-      Serial.println("Channel is busy, waiting to send...");
+    // Read node ID from EEPROM
+    nodeId = EEPROM.read(EEPROM_ADDRESS);
+    if (nodeId < 1 || nodeId > N_NODES) {
+        nodeId = 2; // Change this value for each node before uploading
+        EEPROM.write(EEPROM_ADDRESS, nodeId);
+        EEPROM.commit();
     }
-  }
-
-  delay(100); // Delay singkat untuk menghindari jaringan LoRa yang padat
+    Serial.print("LoRa Node");
+    Serial.println(nodeId);
+    Serial.print(F("Initializing node "));
+    Serial.println(nodeId);
+    manager = new RHMesh(rf95, nodeId);
+    
+    if (!manager->init()) {
+        Serial.println(F("Initialization failed"));
+        return;
+    }
+    
+    rf95.setFrequency(922.0);
+    rf95.setTxPower(setTxPower, false);
+    rf95.setSpreadingFactor(setSpreadingFactor);
+    Serial.println(F("RF95 ready"));
+    pinMode(enTxPin, OUTPUT);
+    digitalWrite(enTxPin, HIGH);  // Default ke TX mode
 }
+
+void loop() {  
+    // Mendengarkan pesan yang masuk
+    DatalogMeasurement();  
+    uint8_t len = sizeof(buf);  
+    uint8_t from;  
+    if (manager->recvfromAckTimeout((uint8_t *)buf, &len, 1000, &from)) {  
+        buf[len] = '\0'; // Null terminate string  
+        Serial.print(F("Received from N"));  
+        Serial.print(from);  
+        Serial.print(F(": "));  
+        Serial.println(buf);  
+          
+        // Meneruskan pesan berdasarkan probabilitas gossip  
+        if (random(0, 100) < GOSSIP_PROBABILITY * 100) {  
+            if (nodeId == 2) {
+                generateDummyData();  
+                sprintf(buf + len, " | Value N2: Rain: %d mm | Distance : %.2f cm", Rain_val, distance / 10);  
+                Serial.println(buf);  
+                uint8_t errorN3 = manager->sendtoWait((uint8_t *)buf, strlen(buf), 3);  
+                if (errorN3 != RH_ROUTER_ERROR_NONE) {  
+                    Serial.print(F("Error sending to N3: "));  
+                    Serial.println(errorN3);
+                    DatalogFailed();  
+                } else {  
+                    Serial.println(F("Message forwarded to N3 successfully"));
+                    Datalog();  
+                }  
+            }  
+        }  
+    }  
+  
+    // Node 1 mengirim pesan ke Node 2  
+    if (nodeId == 1) {  
+        // Cek apakah cukup waktu telah berlalu  
+        unsigned long currentMillis = millis();  
+        if (currentMillis - previousMillis >= interval) {  
+            previousMillis = currentMillis; // Simpan waktu terakhir
+            generateDummyData();  
+  
+            sprintf(buf, "Value N1: Rain: %d mm | Distance: %.2f cm", Rain_val, distance / 10);  
+            Serial.print(F("Sending to N2: "));  
+            Serial.println(buf);  
+            uint8_t errorN2 = manager->sendtoWait((uint8_t *)buf, strlen(buf), 2);  
+            if (errorN2 != RH_ROUTER_ERROR_NONE) {  
+                Serial.print(F("Error sending to N2: "));  
+                Serial.println(errorN2);
+                DatalogFailed();  
+            } else {  
+                Serial.println(F("Message sent to N2 successfully"));
+                Datalog();  
+            }  
+        }  
+    }  
+}  
